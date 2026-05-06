@@ -1,17 +1,15 @@
 import { Router, Request, Response } from 'express';
-import { verifyMessage } from 'viem';
 import { prisma } from '../prisma';
 import { randomBytes } from 'crypto';
 import jwt from 'jsonwebtoken';
+import { ethers } from 'ethers';
 
 const router = Router();
 
-// Step 1: Request a nonce
 router.get('/nonce/:address', async (req: Request, res: Response): Promise<void> => {
   const address = (req.params['address'] as string).toLowerCase();
   const nonce = randomBytes(16).toString('hex');
 
-  // Ensure user exists before creating nonce
   await prisma.user.upsert({
     where: { address },
     update: {},
@@ -27,9 +25,8 @@ router.get('/nonce/:address', async (req: Request, res: Response): Promise<void>
   res.json({ nonce });
 });
 
-// Step 2: Verify signature + issue JWT
 router.post('/verify', async (req: Request, res: Response): Promise<void> => {
-  const { address, signature } = req.body as { address: string; signature: `0x${string}` };
+  const { address, signature } = req.body as { address: string; signature: string };
 
   if (!address || !signature) {
     res.status(400).json({ error: 'Address and signature are required' });
@@ -48,19 +45,13 @@ router.post('/verify', async (req: Request, res: Response): Promise<void> => {
   }
 
   const message = `Sign in to DispatchPay\nNonce: ${record.nonce}`;
+  const recovered = ethers.verifyMessage(message, signature).toLowerCase();
 
-  const valid = await verifyMessage({
-    address: address as `0x${string}`,
-    message,
-    signature,
-  });
-
-  if (!valid) {
+  if (recovered !== normalizedAddress) {
     res.status(401).json({ error: 'Invalid signature' });
     return;
   }
 
-  // Invalidate nonce immediately (prevent replay attacks)
   await prisma.nonce.delete({ where: { address: normalizedAddress } });
 
   const token = jwt.sign({ address: normalizedAddress }, process.env.JWT_SECRET!, {
