@@ -1,12 +1,13 @@
 "use client"
 
-import { readContract } from "wagmi/actions"
+import { useAuth } from "@/lib/useAuth";
+import { RegisterModal } from "@/components/RegisterModal"
+import { createOrder, getMyOrders } from "@/lib/api";
 import { ConnectButton } from "@rainbow-me/rainbowkit"
 import Link from "next/link"
 import { useState, useEffect, useCallback, useRef } from "react"
 import {
     ArrowLeft,
-    MapPin,
     Zap,
     Package,
     CheckCircle,
@@ -23,18 +24,15 @@ import {
 } from "lucide-react"
 import {
     useAccount,
-    useReadContract,
     useWriteContract,
     useWaitForTransactionReceipt,
     usePublicClient,
     useConfig,
 } from "wagmi"
 import { encodeZone, ESCROW_ABI, ESCROW_CONTRACT_ADDRESS, ORDER_STATUS } from "@/constants"
-import { parseUnits } from "viem"
 import { ERC20_ABI as USDC_ABI, USDC_ADDRESS } from "@/constants"
-// ─── Types ────────────────────────────────────────────────────────────────────
 
-type Step = "select" | "approve" | "confirm" | "track"
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 type SellerInfo = {
     address: string
@@ -51,6 +49,7 @@ type BuyerOrder = {
     createdAt: bigint
     confirmedAt: bigint
     deliveredAt: bigint
+    chainNow: number
 }
 
 type ToastState = { msg: string; type: "success" | "error" | "info" } | null
@@ -113,7 +112,6 @@ function OTPConfirmModal({ orderId, attemptsUsed, onClose, onSubmit }: {
     onClose: () => void
     onSubmit: (otp: string) => Promise<void>
 }) {
-    const [otp, setOtp] = useState("")
     const [submitting, setSubmitting] = useState(false)
     const attemptsLeft = 4 - attemptsUsed
     const inputs = useRef<(HTMLInputElement | null)[]>([])
@@ -148,7 +146,6 @@ function OTPConfirmModal({ orderId, attemptsUsed, onClose, onSubmit }: {
     return (
         <div style={{ position: "fixed", inset: 0, zIndex: 999, background: "rgba(12,12,11,0.9)", backdropFilter: "blur(16px)", display: "flex", alignItems: "center", justifyContent: "center", padding: "1rem" }}>
             <div style={{ background: "var(--card)", border: "1px solid var(--border2)", borderRadius: "16px", width: "100%", maxWidth: "420px", overflow: "hidden", animation: "fadeUp .3s ease" }}>
-                {/* Header */}
                 <div style={{ padding: "1.5rem 1.75rem", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                     <div>
                         <div style={{ fontSize: ".65rem", fontFamily: "var(--mono)", color: "var(--muted)", letterSpacing: ".1em", textTransform: "uppercase", marginBottom: ".3rem" }}>Order #{orderId}</div>
@@ -156,14 +153,11 @@ function OTPConfirmModal({ orderId, attemptsUsed, onClose, onSubmit }: {
                     </div>
                     <button onClick={onClose} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "6px", color: "var(--muted)", cursor: "pointer", width: "32px", height: "32px", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1rem" }}>×</button>
                 </div>
-
                 <div style={{ padding: "1.75rem" }}>
                     <p style={{ fontSize: ".82rem", color: "var(--muted)", lineHeight: 1.75, marginBottom: "1.75rem" }}>
                         Enter the 6-digit code the seller sent you via SMS. You have{" "}
                         <strong style={{ color: attemptsLeft <= 1 ? "var(--red)" : "var(--text)" }}>{attemptsLeft} attempt{attemptsLeft !== 1 ? "s" : ""}</strong> remaining.
                     </p>
-
-                    {/* OTP digits */}
                     <div style={{ display: "flex", gap: "8px", justifyContent: "center", marginBottom: "1.5rem" }} onPaste={handlePaste}>
                         {digits.map((d, i) => (
                             <input
@@ -179,14 +173,11 @@ function OTPConfirmModal({ orderId, attemptsUsed, onClose, onSubmit }: {
                             />
                         ))}
                     </div>
-
-                    {/* Attempt dots */}
                     <div style={{ display: "flex", justifyContent: "center", gap: "6px", marginBottom: "1.75rem" }}>
                         {[0, 1, 2, 3].map(i => (
                             <div key={i} style={{ width: "10px", height: "10px", borderRadius: "50%", background: i < attemptsUsed ? "var(--red)" : "var(--border2)", border: `1px solid ${i < attemptsUsed ? "var(--red)" : "var(--border)"}`, transition: "all .2s" }} />
                         ))}
                     </div>
-
                     <button
                         onClick={handleSubmit}
                         disabled={fullOtp.length !== 6 || submitting}
@@ -244,7 +235,7 @@ function OrderCard({ order, onOtp, onDispute, onRelease, onRefund }: {
     order: BuyerOrder
     onOtp: (id: number) => void
     onDispute: (id: number) => void
-    onRelease: (id: number) => void
+    onRelease: (id: number, unlocked: boolean) => void
     onRefund: (id: number) => void
 }) {
     const statusLabel = ORDER_STATUS[order.status as keyof typeof ORDER_STATUS] ?? "Unknown"
@@ -255,32 +246,54 @@ function OrderCard({ order, onOtp, onDispute, onRelease, onRefund }: {
     }
     const color = statusColors[statusLabel] ?? "var(--muted)"
 
-    const isDelivered = order.status === 1   // can enter OTP
-    const isCompleted = order.status === 2   // can dispute or release
-    const isFunded = order.status === 0      // can refund after 7d
+    const isDelivered = order.status === 1
+    const isCompleted = order.status === 2 && Number(order.confirmedAt) > 0
+    const isFunded = order.status === 0
 
-    // Time remaining in dispute window
-    const [disputeSecsLeft, setDisputeSecsLeft] = useState(0)
-    useEffect(() => {
-        if (!isCompleted) return
+    const [disputeSecsLeft, setDisputeSecsLeft] = useState<number>(() => {
+        if (order.status !== 2 || Number(order.confirmedAt) === 0) return 0
         const deadline = Number(order.confirmedAt) + 7200
-        const tick = () => setDisputeSecsLeft(Math.max(0, deadline - Math.floor(Date.now() / 1000)))
-        tick()
-        const id = setInterval(tick, 1000)
-        return () => clearInterval(id)
-    }, [isCompleted, order.confirmedAt])
+        const remaining = deadline - order.chainNow  // CHANGED
+        return remaining > 0 ? remaining : 0
+    })
 
+    useEffect(() => {
+        if (order.status !== 2 || Number(order.confirmedAt) === 0) return
+        const deadline = Number(order.confirmedAt) + 7200
+        const remaining = deadline - order.chainNow  // CHANGED
+        if (remaining <= 0) {
+            setDisputeSecsLeft(0)
+            return
+        }
+        setDisputeSecsLeft(remaining)
+        const id = setInterval(() => {
+            setDisputeSecsLeft(prev => Math.max(0, prev - 1))
+        }, 1000)
+        return () => clearInterval(id)
+    }, [order.status, order.confirmedAt, order.chainNow])
     const fmtCountdown = (s: number) => {
         const m = Math.floor(s / 60); const sec = s % 60
         return `${m}m ${sec.toString().padStart(2, "0")}s`
     }
+
+    console.log("Order", order.id, {
+        status: order.status,
+        confirmedAt: Number(order.confirmedAt),
+        disputeSecsLeft,
+        now: Math.floor(Date.now() / 1000),
+        deadline: Number(order.confirmedAt) + 7200,
+    })
+
+    // Only show Release Funds if: completed + confirmedAt set + 2hrs elapsed
+    const canDispute = isCompleted && disputeSecsLeft > 0
+    const canRelease = isCompleted && Number(order.confirmedAt) > 0  // always show after OTP
+    const releaseUnlocked = isCompleted && disputeSecsLeft === 0 && Number(order.confirmedAt) > 0
 
     return (
         <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "12px", overflow: "hidden", transition: "border-color .2s" }}
             onMouseEnter={e => (e.currentTarget.style.borderColor = "var(--border2)")}
             onMouseLeave={e => (e.currentTarget.style.borderColor = "var(--border)")}
         >
-            {/* Top bar */}
             <div style={{ padding: "1rem 1.25rem", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                     <span style={{ fontFamily: "var(--mono)", fontSize: ".72rem", color: "var(--subtle)" }}>#{order.id}</span>
@@ -288,8 +301,6 @@ function OrderCard({ order, onOtp, onDispute, onRelease, onRefund }: {
                 </div>
                 <span style={{ fontSize: ".72rem", color: "var(--subtle)", fontFamily: "var(--mono)" }}>{timeAgo(order.createdAt)}</span>
             </div>
-
-            {/* Body */}
             <div style={{ padding: "1.25rem" }}>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: ".75rem", marginBottom: "1.25rem" }}>
                     <div>
@@ -306,35 +317,59 @@ function OrderCard({ order, onOtp, onDispute, onRelease, onRefund }: {
                     </div>
                 </div>
 
-                {/* Dispute countdown */}
-                {isCompleted && disputeSecsLeft > 0 && (
+                {canDispute && (
                     <div style={{ background: "rgba(62,207,142,.06)", border: "1px solid rgba(62,207,142,.18)", borderRadius: "8px", padding: ".75rem 1rem", display: "flex", alignItems: "center", gap: "8px", marginBottom: "1rem" }}>
                         <Clock size={13} style={{ color: "var(--green)", flexShrink: 0 }} />
                         <span style={{ fontSize: ".78rem", color: "var(--muted)" }}>Dispute window closes in{" "}<strong style={{ color: "var(--green)", fontFamily: "var(--mono)" }}>{fmtCountdown(disputeSecsLeft)}</strong></span>
                     </div>
                 )}
-                {isCompleted && disputeSecsLeft === 0 && (
+                {canRelease && !releaseUnlocked && (
                     <div style={{ background: "rgba(240,90,26,.06)", border: "1px solid var(--orange-border)", borderRadius: "8px", padding: ".75rem 1rem", display: "flex", alignItems: "center", gap: "8px", marginBottom: "1rem" }}>
-                        <Zap size={13} style={{ color: "var(--orange-text)", flexShrink: 0 }} />
+                        <Clock size={13} style={{ color: "var(--orange-text)", flexShrink: 0 }} />
+                        <span style={{ fontSize: ".78rem", color: "var(--muted)" }}>
+                            Funds locked for dispute window — releases in{" "}
+                            <strong style={{ color: "var(--orange-text)", fontFamily: "var(--mono)" }}>{fmtCountdown(disputeSecsLeft)}</strong>
+                        </span>
+                    </div>
+                )}
+                {releaseUnlocked && (
+                    <div style={{ background: "rgba(62,207,142,.06)", border: "1px solid rgba(62,207,142,.2)", borderRadius: "8px", padding: ".75rem 1rem", display: "flex", alignItems: "center", gap: "8px", marginBottom: "1rem" }}>
+                        <Zap size={13} style={{ color: "var(--green)", flexShrink: 0 }} />
                         <span style={{ fontSize: ".78rem", color: "var(--muted)" }}>Dispute window closed. Funds can now be released to seller.</span>
                     </div>
                 )}
 
-                {/* Actions */}
                 <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
                     {isDelivered && (
                         <button onClick={() => onOtp(order.id)} className="dp-btn-primary" style={{ fontSize: ".82rem", padding: ".6rem 1.25rem" }}>
                             <Hash size={14} /> Enter OTP
                         </button>
                     )}
-                    {isCompleted && disputeSecsLeft > 0 && (
+                    {canDispute && (
                         <button onClick={() => onDispute(order.id)} style={{ background: "rgba(224,82,82,.1)", border: "1px solid rgba(224,82,82,.3)", borderRadius: "6px", color: "var(--red)", padding: ".6rem 1.25rem", fontSize: ".82rem", fontWeight: 600, cursor: "pointer", fontFamily: "'Cabinet Grotesk', sans-serif", display: "flex", alignItems: "center", gap: "6px" }}>
                             <AlertTriangle size={14} /> Dispute
                         </button>
                     )}
-                    {isCompleted && disputeSecsLeft === 0 && (
-                        <button onClick={() => onRelease(order.id)} style={{ background: "rgba(62,207,142,.1)", border: "1px solid rgba(62,207,142,.3)", borderRadius: "6px", color: "var(--green)", padding: ".6rem 1.25rem", fontSize: ".82rem", fontWeight: 600, cursor: "pointer", fontFamily: "'Cabinet Grotesk', sans-serif", display: "flex", alignItems: "center", gap: "6px" }}>
-                            <Zap size={14} /> Release Funds
+                    {canRelease && (
+                        <button
+                            onClick={() => onRelease(order.id, releaseUnlocked)}
+                            style={{
+                                background: releaseUnlocked ? "rgba(62,207,142,.1)" : "rgba(120,120,120,.1)",
+                                border: `1px solid ${releaseUnlocked ? "rgba(62,207,142,.3)" : "var(--border2)"}`,
+                                borderRadius: "6px",
+                                color: releaseUnlocked ? "var(--green)" : "var(--muted)",
+                                padding: ".6rem 1.25rem",
+                                fontSize: ".82rem",
+                                fontWeight: 600,
+                                cursor: "pointer",
+                                fontFamily: "'Cabinet Grotesk', sans-serif",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "6px"
+                            }}
+                        >
+                            <Zap size={14} />
+                            {releaseUnlocked ? "Release Funds" : `Release in ${fmtCountdown(disputeSecsLeft)}`}
                         </button>
                     )}
                     {isFunded && (
@@ -351,7 +386,7 @@ function OrderCard({ order, onOtp, onDispute, onRelease, onRefund }: {
 // ─── Place Order Panel ────────────────────────────────────────────────────────
 
 function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain: any; onSuccess: () => void }) {
-    const config = useConfig()
+    useConfig()
     const { writeContractAsync } = useWriteContract()
     const publicClient = usePublicClient()
 
@@ -366,15 +401,22 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
 
     const showToast = (msg: string, type: "success" | "error" | "info" = "info") => setToast({ msg, type })
 
+    const selectedZoneData = sellerInfo?.zones.find(z => z.key === selectedZone)
+
     const { isSuccess: txSuccess } = useWaitForTransactionReceipt({ hash: txHash })
+
+    // ── Handle transaction confirmation ──────────────────────────────────────
     useEffect(() => {
         if (!txSuccess) return
         showToast("Transaction confirmed ✓", "success")
         setPending(false)
+
         if (step === "approve") {
             setTxHash(undefined)
             setStep("order")
+            return
         }
+
         if (step === "order") {
             ; (async () => {
                 try {
@@ -382,28 +424,25 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
                     const raw = receipt.logs[receipt.logs.length - 1] as any
                     if (raw) {
                         const orderId = Number(BigInt(raw.topics[1]))
-
-                        // Save for buyer
-                        const existing = JSON.parse(localStorage.getItem("dp_order_ids") || "[]")
-                        if (!existing.includes(orderId)) {
-                            localStorage.setItem("dp_order_ids", JSON.stringify([...existing, orderId]))
-                        }
-
-                        // Save for seller
-                        const sellerKey = `dp_seller_order_ids_${sellerInfo!.address.toLowerCase()}`
-                        const sellerExisting = JSON.parse(localStorage.getItem(sellerKey) || "[]")
-                        if (!sellerExisting.includes(orderId)) {
-                            localStorage.setItem(sellerKey, JSON.stringify([...sellerExisting, orderId]))
-                        }
+                        await createOrder(
+                            orderId.toString(),
+                            sellerInfo!.address,
+                            selectedZoneData!.price.toString(),
+                            txHash!
+                        )
                     }
                 } catch (e) {
-                    console.error("Failed to save order ID", e)
+                    console.error("Failed to save order", e)
                 }
                 setTxHash(undefined)
-                setStep("lookup"); setSellerAddr(""); setSellerInfo(null); setSelectedZone(null); onSuccess()
+                setStep("lookup")
+                setSellerAddr("")
+                setSellerInfo(null)
+                setSelectedZone(null)
+                onSuccess()
             })()
         }
-    }, [txSuccess, step])
+    }, [txSuccess, step]) // eslint-disable-line react-hooks/exhaustive-deps
 
     const lookupSeller = async () => {
         if (!sellerAddr || !sellerAddr.startsWith("0x") || sellerAddr.length !== 42) {
@@ -417,7 +456,6 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
                 functionName: "sellerAvailable",
                 args: [sellerAddr as `0x${string}`],
             })
-
             const zones: SellerInfo["zones"] = []
             await Promise.all(
                 PRESET_ZONES.map(async z => {
@@ -430,7 +468,6 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
                     if (price > BigInt(0)) zones.push({ key: z.key, name: z.name, price })
                 })
             )
-
             setSellerInfo({ address: sellerAddr, available, zones })
             setStep("zone")
         } catch (e) {
@@ -439,8 +476,6 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
             setLookingUp(false)
         }
     }
-
-    const selectedZoneData = sellerInfo?.zones.find(z => z.key === selectedZone)
 
     const handleApprove = async () => {
         if (!selectedZoneData) return
@@ -482,10 +517,10 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
             showToast(e?.message?.slice(0, 80) || "Order failed", "error")
         }
     }
+
     return (
         <>
             <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "14px", overflow: "hidden" }}>
-                {/* Header */}
                 <div style={{ padding: "1.5rem", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: "12px" }}>
                     <div style={{ width: "38px", height: "38px", background: "var(--orange-glow)", border: "1px solid var(--orange-border)", borderRadius: "10px", display: "flex", alignItems: "center", justifyContent: "center" }}>
                         <Lock size={16} style={{ color: "var(--orange-text)" }} />
@@ -552,7 +587,6 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
                     {/* STEP: ZONE */}
                     {step === "zone" && sellerInfo && (
                         <div style={{ display: "flex", flexDirection: "column", gap: "1.25rem" }}>
-                            {/* Seller info banner */}
                             <div style={{ background: sellerInfo.available ? "rgba(62,207,142,.06)" : "rgba(224,82,82,.06)", border: `1px solid ${sellerInfo.available ? "rgba(62,207,142,.2)" : "rgba(224,82,82,.2)"}`, borderRadius: "8px", padding: "1rem 1.25rem", display: "flex", alignItems: "center", gap: "10px" }}>
                                 <div style={{ width: "10px", height: "10px", borderRadius: "50%", background: sellerInfo.available ? "var(--green)" : "var(--red)", boxShadow: sellerInfo.available ? "0 0 8px var(--green)" : "none", flexShrink: 0 }} />
                                 <div>
@@ -563,17 +597,11 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
                             </div>
 
                             {!sellerInfo.available && (
-                                <div style={{ padding: "2rem", textAlign: "center", color: "var(--muted)", fontSize: ".85rem" }}>
-                                    This seller is currently offline. Try another seller.
-                                </div>
+                                <div style={{ padding: "2rem", textAlign: "center", color: "var(--muted)", fontSize: ".85rem" }}>This seller is currently offline. Try another seller.</div>
                             )}
-
                             {sellerInfo.available && sellerInfo.zones.length === 0 && (
-                                <div style={{ padding: "2rem", textAlign: "center", color: "var(--muted)", fontSize: ".85rem" }}>
-                                    This seller has no zones configured yet.
-                                </div>
+                                <div style={{ padding: "2rem", textAlign: "center", color: "var(--muted)", fontSize: ".85rem" }}>This seller has no zones configured yet.</div>
                             )}
-
                             {sellerInfo.available && sellerInfo.zones.length > 0 && (
                                 <>
                                     <div>
@@ -595,7 +623,6 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
                                             ))}
                                         </div>
                                     </div>
-
                                     {selectedZoneData && (
                                         <div style={{ background: "var(--faint)", border: "1px solid var(--border2)", borderRadius: "10px", padding: "1rem 1.25rem", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                                             <div style={{ fontSize: ".82rem", color: "var(--muted)" }}>
@@ -605,7 +632,6 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
                                             <Lock size={16} style={{ color: "var(--orange-text)", flexShrink: 0 }} />
                                         </div>
                                     )}
-
                                     <button onClick={() => setStep("approve")} disabled={!selectedZone} className="dp-btn-primary" style={{ justifyContent: "center", opacity: !selectedZone ? 0.5 : 1 }}>
                                         Continue <ArrowRight size={14} />
                                     </button>
@@ -673,10 +699,11 @@ function PlaceOrderPanel({ address, chain, onSuccess }: { address: string; chain
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function BuyerPage() {
-    const config = useConfig()
+    useConfig()
     const { address, isConnected, chain } = useAccount()
     const { writeContractAsync } = useWriteContract()
     const publicClient = usePublicClient()
+    const { user, setUser, authenticated, login, loading: authLoading } = useAuth()
 
     const [toast, setToast] = useState<ToastState>(null)
     const [tab, setTab] = useState<"order" | "orders">("order")
@@ -688,45 +715,48 @@ export default function BuyerPage() {
     const [otpAttempts, setOtpAttempts] = useState<Record<number, number>>({})
 
     const { isSuccess: txSuccess } = useWaitForTransactionReceipt({ hash: txHash })
-    useEffect(() => {
-        if (txSuccess) {
-            showToast("Transaction confirmed on-chain ✓", "success")
-            setTxHash(undefined)
-            setTimeout(() => fetchBuyerOrders(), 3000)
-        }
-    }, [txSuccess])
 
     const showToast = useCallback((msg: string, type: "success" | "error" | "info" = "info") => setToast({ msg, type }), [])
 
+    // Single txSuccess handler for main page (OTP, dispute, release, refund)
+    useEffect(() => {
+        if (!txSuccess) return
+        showToast("Transaction confirmed on-chain ✓", "success")
+        setTxHash(undefined)
+        setTimeout(() => fetchBuyerOrders(), 3000)
+    }, [txSuccess]) // eslint-disable-line react-hooks/exhaustive-deps
 
     const fetchBuyerOrders = useCallback(async () => {
         if (!address || !publicClient) return
         setLoadingOrders(true)
         try {
-            const stored: number[] = JSON.parse(localStorage.getItem("dp_order_ids") || "[]")
-            if (stored.length === 0) { setLoadingOrders(false); return }
+            const backendOrders = await getMyOrders()
+            if (backendOrders.length === 0) { setLoadingOrders(false); return }
+
+            const block = await publicClient.getBlock()  // ADD THIS
+            const chainNow = Number(block.timestamp)      // ADD THIS
 
             const orders = await Promise.all(
-                stored.map(async (orderId) => {
+                backendOrders.map(async (backendOrder: any) => {
                     try {
                         const order = await publicClient.readContract({
                             address: ESCROW_CONTRACT_ADDRESS,
                             abi: ESCROW_ABI,
                             functionName: "getOrder",
-                            args: [BigInt(orderId)],
+                            args: [BigInt(backendOrder.onchainId)],
                         } as any) as any
 
                         const attempts = await publicClient.readContract({
                             address: ESCROW_CONTRACT_ADDRESS,
                             abi: ESCROW_ABI,
                             functionName: "otpAttempts",
-                            args: [BigInt(orderId)],
+                            args: [BigInt(backendOrder.onchainId)],
                         } as any) as number
 
-                        setOtpAttempts(p => ({ ...p, [orderId]: attempts }))
+                        setOtpAttempts(p => ({ ...p, [backendOrder.onchainId]: attempts }))
 
                         return {
-                            id: orderId,
+                            id: Number(backendOrder.onchainId),
                             seller: order.seller as string,
                             zone: order.zone as string,
                             usdcAmount: order.usdcAmount as bigint,
@@ -734,6 +764,7 @@ export default function BuyerPage() {
                             createdAt: order.createdAt as bigint,
                             confirmedAt: order.confirmedAt as bigint,
                             deliveredAt: order.deliveredAt as bigint,
+                            chainNow,  // ADD THIS
                         } satisfies BuyerOrder
                     } catch { return null }
                 })
@@ -760,6 +791,7 @@ export default function BuyerPage() {
                 args: [BigInt(orderId), otp],
                 chain,
                 account: address,
+                gas: BigInt(300000),
             })
             setTxHash(hash)
             setOtpModal(null)
@@ -789,7 +821,11 @@ export default function BuyerPage() {
         }
     }
 
-    const handleRelease = async (orderId: number) => {
+    const handleRelease = async (orderId: number, unlocked: boolean) => {
+        if (!unlocked) {
+            showToast("Funds are still locked — dispute window hasn't closed yet", "error")
+            return  // never opens MetaMask
+        }
         try {
             const hash = await writeContractAsync({
                 address: ESCROW_CONTRACT_ADDRESS,
@@ -798,6 +834,7 @@ export default function BuyerPage() {
                 args: [BigInt(orderId)],
                 chain,
                 account: address,
+                gas: BigInt(200000),
             })
             setTxHash(hash)
             showToast(`Releasing funds for order #${orderId}…`, "info")
@@ -805,7 +842,6 @@ export default function BuyerPage() {
             showToast(e?.message?.slice(0, 80) || "Release failed", "error")
         }
     }
-
     const handleRefund = async (orderId: number) => {
         try {
             const hash = await writeContractAsync({
@@ -823,8 +859,7 @@ export default function BuyerPage() {
         }
     }
 
-    // ── Not connected ────────────────────────────────────────────────────────
-
+    // ── Not connected ──────────────────────────────────────────────────────────
     if (!isConnected) {
         return (
             <main style={{ fontFamily: "'Cabinet Grotesk', 'Satoshi', sans-serif", background: "#0C0C0B", color: "#F0EDE6", minHeight: "100vh" }}>
@@ -855,12 +890,40 @@ export default function BuyerPage() {
         )
     }
 
-    // ── Connected ────────────────────────────────────────────────────────────
+    // ── Not authenticated ──────────────────────────────────────────────────────
+    if (isConnected && !authenticated) {
+        return (
+            <main style={{ fontFamily: "'Cabinet Grotesk', 'Satoshi', sans-serif", background: "#0C0C0B", color: "#F0EDE6", minHeight: "100vh" }}>
+                <Style />
+                <nav className="dp-nav">
+                    <Link className="dp-logo" href="/"><div className="dp-logo-mark">D</div><span className="dp-logo-text">DispatchPay</span></Link>
+                    <div className="dp-nav-right"><ConnectButton /></div>
+                </nav>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", flexDirection: "column", gap: "1.5rem", padding: "2rem", textAlign: "center" }}>
+                    <div style={{ fontSize: "1.2rem", fontWeight: 900, letterSpacing: "-.03em" }}>Sign in to continue</div>
+                    <div style={{ fontSize: ".85rem", color: "var(--muted)" }}>Sign a message with your wallet to authenticate</div>
+                    <button className="dp-btn-primary" onClick={login} disabled={authLoading}>
+                        {authLoading ? "Signing in…" : "Sign in with wallet"}
+                    </button>
+                </div>
+            </main>
+        )
+    }
 
+    // ── Registration ───────────────────────────────────────────────────────────
+    if (authenticated && !user?.name) {
+        return (
+            <>
+                <Style />
+                <RegisterModal onSuccess={(u) => setUser(u)} />
+            </>
+        )
+    }
+
+    // ── Connected ──────────────────────────────────────────────────────────────
     return (
         <main style={{ fontFamily: "'Cabinet Grotesk', 'Satoshi', sans-serif", background: "#0C0C0B", color: "#F0EDE6", minHeight: "100vh" }}>
             <Style />
-
             <nav className="dp-nav">
                 <Link className="dp-logo" href="/"><div className="dp-logo-mark">D</div><span className="dp-logo-text">DispatchPay</span></Link>
                 <div className="dp-nav-right">
@@ -872,7 +935,6 @@ export default function BuyerPage() {
             </nav>
 
             <div style={{ maxWidth: "960px", margin: "0 auto", padding: "100px 2rem 4rem" }}>
-                {/* Header */}
                 <div style={{ marginBottom: "2.5rem" }}>
                     <div style={{ fontSize: ".65rem", fontFamily: "var(--mono)", color: "var(--muted)", letterSpacing: ".12em", textTransform: "uppercase", marginBottom: ".5rem" }}>Buyer Dashboard</div>
                     <h1 style={{ fontSize: "clamp(1.5rem, 3vw, 2.1rem)", fontWeight: 900, letterSpacing: "-.04em", lineHeight: 1, marginBottom: ".5rem", fontFamily: "'Cabinet Grotesk', sans-serif" }}>
@@ -881,7 +943,6 @@ export default function BuyerPage() {
                     <div style={{ fontSize: ".82rem", color: "var(--muted)" }}>Funds locked on-chain · released only when you confirm delivery</div>
                 </div>
 
-                {/* Stats */}
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "1px", background: "var(--border)", borderRadius: "10px", overflow: "hidden", marginBottom: "2rem" }}>
                     {[
                         { label: "Total orders", value: buyerOrders.length.toString() },
@@ -896,7 +957,6 @@ export default function BuyerPage() {
                     ))}
                 </div>
 
-                {/* Tabs */}
                 <div style={{ display: "flex", gap: "2px", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "8px", padding: "3px", marginBottom: "2rem", width: "fit-content" }}>
                     {(["order", "orders"] as const).map(t => (
                         <button key={t} onClick={() => setTab(t)} style={{ background: tab === t ? "var(--card2)" : "none", border: tab === t ? "1px solid var(--border2)" : "1px solid transparent", borderRadius: "6px", color: tab === t ? "var(--text)" : "var(--muted)", padding: ".55rem 1.5rem", fontSize: ".82rem", fontWeight: tab === t ? 700 : 400, fontFamily: "'Cabinet Grotesk', sans-serif", cursor: "pointer", transition: "all .15s", textTransform: t === "order" ? "none" : "capitalize" }}>
@@ -905,14 +965,10 @@ export default function BuyerPage() {
                     ))}
                 </div>
 
-                {/* ── PLACE ORDER TAB ──── */}
                 {tab === "order" && (
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: "1.5rem", alignItems: "start" }}>
                         <PlaceOrderPanel address={address!} chain={chain} onSuccess={() => { setTab("orders"); fetchBuyerOrders() }} />
-
-                        {/* Side info */}
                         <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
-                            {/* Protections */}
                             <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "12px", overflow: "hidden" }}>
                                 <div style={{ padding: "1rem 1.25rem", borderBottom: "1px solid var(--border)", fontSize: ".82rem", fontWeight: 700 }}>Your protections</div>
                                 <div style={{ padding: "1rem 1.25rem", display: "flex", flexDirection: "column", gap: ".875rem" }}>
@@ -932,8 +988,6 @@ export default function BuyerPage() {
                                     ))}
                                 </div>
                             </div>
-
-                            {/* Flow */}
                             <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "12px", overflow: "hidden" }}>
                                 <div style={{ padding: "1rem 1.25rem", borderBottom: "1px solid var(--border)", fontSize: ".82rem", fontWeight: 700 }}>What happens next</div>
                                 <div style={{ padding: "1rem 1.25rem", display: "flex", flexDirection: "column", gap: ".75rem" }}>
@@ -955,11 +1009,10 @@ export default function BuyerPage() {
                     </div>
                 )}
 
-                {/* ── MY ORDERS TAB ──── */}
                 {tab === "orders" && (
                     <div>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1.5rem" }}>
-                            <div style={{ fontSize: ".82rem", color: "var(--muted)" }}>All orders you&apos;ve placed, read from on-chain events.</div>
+                            <div style={{ fontSize: ".82rem", color: "var(--muted)" }}>All orders you&apos;ve placed, read from on-chain.</div>
                             <button onClick={fetchBuyerOrders} disabled={loadingOrders} style={{ background: "none", border: "1px solid var(--border2)", borderRadius: "6px", color: "var(--muted)", cursor: loadingOrders ? "not-allowed" : "pointer", padding: ".5rem .875rem", fontSize: ".78rem", fontFamily: "'Cabinet Grotesk', sans-serif", display: "flex", alignItems: "center", gap: "6px", opacity: loadingOrders ? 0.6 : 1 }}>
                                 {loadingOrders ? <><Loader2 size={13} style={{ animation: "spin 1s linear infinite" }} /> Fetching…</> : <><RefreshCw size={13} /> Refresh</>}
                             </button>

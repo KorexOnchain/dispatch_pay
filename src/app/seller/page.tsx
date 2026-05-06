@@ -1,5 +1,8 @@
 "use client"
 
+import { useAuth } from "@/lib/useAuth";
+import { RegisterModal } from "@/components/RegisterModal";
+import { getMyOrders, generateOtp } from "@/lib/api";
 import { ConnectButton } from "@rainbow-me/rainbowkit"
 import Link from "next/link"
 import { useState, useEffect, useCallback, useRef } from "react"
@@ -42,6 +45,7 @@ type ActiveOrder = {
     status: number
     createdAt: bigint
     deliveredAt: bigint
+    confirmedAt: bigint
 }
 
 type ZoneInput = { name: string; key: string; price: string }
@@ -207,6 +211,7 @@ export default function SellerPage() {
     const { address, isConnected, chain } = useAccount()
     const { writeContractAsync } = useWriteContract()
     const publicClient = usePublicClient()
+    const { user, setUser, authenticated, login, loading: authLoading } = useAuth();
 
     const [toast, setToast] = useState<ToastState>(null)
     const [tab, setTab] = useState<"dashboard" | "zones" | "orders">("dashboard")
@@ -277,28 +282,28 @@ export default function SellerPage() {
         if (!address || !publicClient) return
         setLoadingOrders(true)
         try {
-            const sellerKey = `dp_seller_order_ids_${address.toLowerCase()}`
-            const stored: number[] = JSON.parse(localStorage.getItem(sellerKey) || "[]")
-            if (stored.length === 0) { setLoadingOrders(false); return }
+            const backendOrders = await getMyOrders()
+            if (backendOrders.length === 0) { setLoadingOrders(false); return }
 
             const orders = await Promise.all(
-                stored.map(async (orderId) => {
+                backendOrders.map(async (backendOrder: any) => {
                     try {
                         const order = await publicClient.readContract({
                             address: ESCROW_CONTRACT_ADDRESS,
                             abi: ESCROW_ABI,
                             functionName: "getOrder",
-                            args: [BigInt(orderId)],
+                            args: [BigInt(backendOrder.onchainId)],
                         } as any) as any
 
                         return {
-                            id: orderId,
+                            id: Number(backendOrder.onchainId),
                             buyer: order.buyer as string,
                             zone: order.zone as string,
                             usdcAmount: order.usdcAmount as bigint,
                             status: Number(order.status),
                             createdAt: order.createdAt as bigint,
                             deliveredAt: order.deliveredAt as bigint,
+                            confirmedAt: order.confirmedAt as bigint,
                         } satisfies ActiveOrder
                     } catch { return null }
                 })
@@ -306,16 +311,39 @@ export default function SellerPage() {
 
             const valid = orders.filter((o): o is ActiveOrder => o !== null)
             setSellerOrders(valid.sort((a, b) => b.id - a.id))
+
+            // Auto-release eligible orders
+            const block = await publicClient.getBlock()
+            const chainNow = Number(block.timestamp)
+
+            for (const order of valid) {
+                const isCompleted = order.status === 2
+                const confirmedAt = Number(order.confirmedAt)
+                const deadline = confirmedAt + 7200
+                if (isCompleted && confirmedAt > 0 && chainNow >= deadline) {
+                    try {
+                        await writeContractAsync({
+                            address: ESCROW_CONTRACT_ADDRESS,
+                            abi: ESCROW_ABI,
+                            functionName: "releaseFunds",
+                            args: [BigInt(order.id)],
+                            chain,
+                            account: address,
+                            gas: BigInt(200000),
+                        })
+                        showToast(`Funds released for order #${order.id} ✓`, "success")
+                    } catch (e) {
+                        // silently ignore
+                    }
+                }
+            }
+
         } catch (e) {
             showToast("Failed to fetch orders from chain", "error")
         } finally {
             setLoadingOrders(false)
         }
     }, [address, publicClient, showToast])
-    useEffect(() => {
-        if (tab === "orders") fetchSellerOrders()
-    }, [tab, fetchSellerOrders])
-
     // ── Actions ───────────────────────────────────────────────────────────────
 
     const toggleAvailability = async () => {
@@ -385,18 +413,30 @@ export default function SellerPage() {
     }
 
     const handleMarkDelivered = async (orderId: number, otpHash: `0x${string}`) => {
-        const hash = await writeContractAsync({
-            address: ESCROW_CONTRACT_ADDRESS,
-            abi: ESCROW_ABI,
-            functionName: "markDelivered",
-            args: [BigInt(orderId), otpHash],
-            chain,
-            account: address,
-        })
-        setTxHash(hash)
-        setOtpModal(null)
-        showToast(`Order #${orderId} marked delivered. Send the OTP to buyer!`, "success")
-        setTimeout(() => fetchSellerOrders(), 4000)
+        try {
+            const hash = await writeContractAsync({
+                address: ESCROW_CONTRACT_ADDRESS,
+                abi: ESCROW_ABI,
+                functionName: "markDelivered",
+                args: [BigInt(orderId), otpHash],
+                chain,
+                account: address,
+            })
+            setTxHash(hash)
+
+            // Get OTP from backend after marking delivered on-chain
+            const backendOrders = await getMyOrders()
+            const backendOrder = backendOrders.find((o: any) => o.onchainId === orderId.toString())
+            if (backendOrder) {
+                const otp = await generateOtp(backendOrder.id)
+                showToast(`OTP for order #${orderId}: ${otp} — send to buyer!`, "success")
+            }
+
+            setOtpModal(null)
+            setTimeout(() => fetchSellerOrders(), 4000)
+        } catch (e: any) {
+            showToast(e?.message?.slice(0, 80) || "Failed to mark delivered", "error")
+        }
     }
 
     const configuredZones = PRESET_ZONES.filter(z => onChainPrices[z.key] && onChainPrices[z.key] > BigInt(0))
@@ -422,6 +462,34 @@ export default function SellerPage() {
                     <ConnectButton />
                 </div>
             </main>
+        )
+    }
+
+    if (isConnected && !authenticated) {
+        return (
+            <main style={{ fontFamily: "'Cabinet Grotesk', 'Satoshi', sans-serif", background: "#0C0C0B", color: "#F0EDE6", minHeight: "100vh" }}>
+                <Style />
+                <nav className="dp-nav">
+                    <Link className="dp-logo" href="/"><div className="dp-logo-mark">D</div><span className="dp-logo-text">DispatchPay</span></Link>
+                    <div className="dp-nav-right"><ConnectButton /></div>
+                </nav>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", flexDirection: "column", gap: "1.5rem", padding: "2rem", textAlign: "center" }}>
+                    <div style={{ fontSize: "1.2rem", fontWeight: 900, letterSpacing: "-.03em" }}>Sign in to continue</div>
+                    <div style={{ fontSize: ".85rem", color: "var(--muted)" }}>Sign a message with your wallet to authenticate</div>
+                    <button className="dp-btn-primary" onClick={login} disabled={authLoading}>
+                        {authLoading ? "Signing in…" : "Sign in with wallet"}
+                    </button>
+                </div>
+            </main>
+        );
+    }
+
+    if (authenticated && !user?.name) {
+        return (
+            <>
+                <Style />
+                <RegisterModal onSuccess={(u) => setUser(u)} />
+            </>
         )
     }
 

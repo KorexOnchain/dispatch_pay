@@ -11,6 +11,13 @@ router.get('/nonce/:address', async (req: Request, res: Response): Promise<void>
   const address = (req.params['address'] as string).toLowerCase();
   const nonce = randomBytes(16).toString('hex');
 
+  // Ensure user exists before creating nonce
+  await prisma.user.upsert({
+    where: { address },
+    update: {},
+    create: { address, name: '', phone: '', role: 'BUYER' },
+  });
+
   await prisma.nonce.upsert({
     where: { address },
     update: { nonce },
