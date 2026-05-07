@@ -1,10 +1,25 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../prisma';
-import { randomBytes } from 'crypto';
+import { randomBytes, createHash } from 'crypto';
 import jwt from 'jsonwebtoken';
-import { ethers } from 'ethers';
+import { createRequire } from 'module';
 
 const router = Router();
+
+function recoverAddress(message: string, signature: string): string {
+  const { ecdsaRecover } = require('secp256k1');
+  const msgHash = createHash('sha256')
+    .update(`\x19Ethereum Signed Message:\n${message.length}${message}`)
+    .digest();
+  const sigBuf = Buffer.from(signature.slice(2), 'hex');
+  const r = sigBuf.slice(0, 32);
+  const s = sigBuf.slice(32, 64);
+  const v = sigBuf[64];
+  const recovery = v < 27 ? v : v - 27;
+  const pubKey = ecdsaRecover(Buffer.concat([r, s]), recovery, msgHash, false);
+  const pubKeyHash = createHash('sha256').update(pubKey.slice(1)).digest('hex');
+  return '0x' + pubKeyHash.slice(-40);
+}
 
 router.get('/nonce/:address', async (req: Request, res: Response): Promise<void> => {
   const address = (req.params['address'] as string).toLowerCase();
@@ -34,10 +49,7 @@ router.post('/verify', async (req: Request, res: Response): Promise<void> => {
   }
 
   const normalizedAddress = address.toLowerCase();
-
-  const record = await prisma.nonce.findUnique({
-    where: { address: normalizedAddress },
-  });
+  const record = await prisma.nonce.findUnique({ where: { address: normalizedAddress } });
 
   if (!record) {
     res.status(400).json({ error: 'No nonce found. Request a nonce first.' });
@@ -45,19 +57,23 @@ router.post('/verify', async (req: Request, res: Response): Promise<void> => {
   }
 
   const message = `Sign in to DispatchPay\nNonce: ${record.nonce}`;
-  const recovered = ethers.verifyMessage(message, signature).toLowerCase();
 
-  if (recovered !== normalizedAddress) {
+  try {
+    const { verifyMessage } = await import('ethers');
+    const recovered = verifyMessage(message, signature).toLowerCase();
+
+    if (recovered !== normalizedAddress) {
+      res.status(401).json({ error: 'Invalid signature' });
+      return;
+    }
+  } catch {
     res.status(401).json({ error: 'Invalid signature' });
     return;
   }
 
   await prisma.nonce.delete({ where: { address: normalizedAddress } });
 
-  const token = jwt.sign({ address: normalizedAddress }, process.env.JWT_SECRET!, {
-    expiresIn: '7d',
-  });
-
+  const token = jwt.sign({ address: normalizedAddress }, process.env.JWT_SECRET!, { expiresIn: '7d' });
   res.json({ token });
 });
 

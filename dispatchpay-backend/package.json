@@ -22,7 +22,8 @@
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
     "pg": "^8.20.0",
-    "prisma": "^5.22.0"
+    "prisma": "^5.22.0",
+    "viem": "^2.48.8"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
