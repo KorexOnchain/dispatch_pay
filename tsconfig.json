@@ -9,14 +9,15 @@
     "incremental": true,
     "module": "esnext",
     "esModuleInterop": true,
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
     "jsx": "react-jsx",
     "paths": {
       "@/*": ["./src/*"]
     },
-    "plugins": [{"name": "next"}]
+    "plugins": [{"name": "next"}],
+    "ignoreDeprecations": "5.0"
   },
   "include": [
     "next-env.d.ts",
@@ -26,5 +27,5 @@
     "**/*.ts",
     "**/*.tsx"
   ],
- "exclude": ["node_modules", "dispatchpay-backend", "contracts"]
+  "exclude": ["node_modules", "dispatchpay-backend", "contracts"]
 }
